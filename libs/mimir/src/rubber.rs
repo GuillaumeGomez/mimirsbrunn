@@ -555,32 +555,43 @@ impl Rubber {
         iter: I,
     ) -> Result<usize, rs_es::error::EsError>
     where
-        T: MimirObject + std::marker::Send + 'static,
-        I: Iterator<Item = T>,
+        T: MimirObject + std::marker::Send,
+        I: Iterator<Item = T>  + std::marker::Send,
     {
-        use par_map::ParMap;
+        use rayon::iter::*;
+
         use rs_es::operations::bulk::Action;
         let mut nb = 0;
         let chunk_size = 1000;
-        let chunks = iter.pack(chunk_size).par_map(|v| {
-            v.into_iter()
-                .map(|v| {
-                    v.es_id()
-                        .into_iter()
-                        .fold(Action::index(v), |action, id| action.with_id(id))
-                })
-                .collect::<Vec<_>>()
-        });
-        for chunk in chunks.filter(|c| !c.is_empty()) {
-            nb += chunk.len();
-            self.es_client
-                .bulk(&chunk)
-                .with_index(&index.name)
-                .with_doc_type(T::doc_type())
-                .send()?;
-        }
+        let mut items = Vec::with_capacity(chunk_size);
+        let mut chunks = Vec::new();
 
-        Ok(nb)
+        for x in iter.chunks(chunk_size).par_bridge().into_par_iter() {
+            items.push(x);
+            if items.len() >= chunk_size {
+                chunks.push(items.into_iter()
+                    .map(|v| {
+                        v.es_id()
+                            .into_iter()
+                            .fold(Action::index(v), |action, id| action.with_id(id))
+                    })
+                    .collect::<Vec<_>>());
+            }
+        }
+        Ok(chunks.par_iter().filter(|c| !c.is_empty()).filter_map(|chunk| {
+            nb += chunk.len();
+            match self.es_client
+                      .bulk(&chunk)
+                      .with_index(&index.name)
+                      .with_doc_type(T::doc_type())
+                      .send() {
+                Ok(_) => Some(chunk.len()),
+                Err(e) => {
+                    eprintln!("Fqiled to send bulk: {:?}", e);
+                    None
+                }
+            }
+        }).sum())
     }
 
     /// add all the element of 'iter' into elasticsearch
